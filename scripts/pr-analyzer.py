@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-PR Analyzer - Analyze PR complexity and suggest review approach.
+PR Analyzer - Inventory a Git unified diff using size-based heuristics.
+
+Requires Python 3.10+. No third-party dependencies.
 
 Usage:
-    python pr-analyzer.py [--diff-file FILE] [--stats]
+    python3 pr-analyzer.py [--diff-file FILE] [--stats]
 
     Or pipe diff directly:
-    git diff develop...HEAD | python pr-analyzer.py
+    git diff --no-color BASE...HEAD | python3 pr-analyzer.py
 """
 
-import sys
-import re
 import argparse
+import codecs
+import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Dict
 
 
 @dataclass
@@ -36,12 +38,12 @@ class PRAnalysis:
   total_files: int
   total_additions: int
   total_deletions: int
-  files: List[FileStats]
+  files: list[FileStats]
   complexity_score: float
   size_category: str
   estimated_review_time: int
-  risk_factors: List[str]
-  suggestions: List[str]
+  risk_factors: list[str]
+  suggestions: list[str]
 
 
 def detect_language(filename: str) -> str:
@@ -52,6 +54,10 @@ def detect_language(filename: str) -> str:
     '.ts': 'TypeScript',
     '.tsx': 'TypeScript/React',
     '.jsx': 'JavaScript/React',
+    '.mjs': 'JavaScript',
+    '.cjs': 'JavaScript',
+    '.mts': 'TypeScript',
+    '.cts': 'TypeScript',
     '.go': 'Go',
     '.java': 'Java',
     '.rb': 'Ruby',
@@ -62,6 +68,9 @@ def detect_language(filename: str) -> str:
     '.yml': 'YAML',
     '.toml': 'TOML',
     '.css': 'CSS',
+    '.scss': 'Sass',
+    '.sass': 'Sass',
+    '.less': 'Less',
     '.html': 'HTML',
     '.jsonnet': 'Configuration Language',
   }
@@ -74,12 +83,11 @@ def detect_language(filename: str) -> str:
 def is_test_file(filename: str) -> bool:
   """Check if file is a test file."""
   test_patterns = [
-    r'test_.*\.py$',
-    r'.*_test\.py$',
-    r'.*\.test\.(js|ts|tsx)$',
-    r'.*\.spec\.(js|ts|tsx)$',
-    r'tests?/',
-    r'__tests__/',
+    r'(^|/)test_[^/]*\.py$',
+    r'_test\.(py|go)$',
+    r'\.(test|spec)\.(js|jsx|ts|tsx|mjs|cjs|mts|cts)$',
+    r'(^|/)(tests?|__tests__)/',
+    r'(^|/)[^/]*(Test|Tests)\.java$',
   ]
   return any(re.search(p, filename) for p in test_patterns)
 
@@ -100,40 +108,104 @@ def is_config_file(filename: str) -> bool:
   return any(re.search(p, filename) for p in config_patterns)
 
 
-def parse_diff(diff_content: str) -> List[FileStats]:
-  """Parse git diff output and extract file statistics."""
+def decode_git_path(path: str) -> str:
+  """Decode Git's C-quoted filenames, including octal UTF-8 bytes."""
+  if path.startswith('"'):
+    if not path.endswith('"'):
+      raise ValueError('Unterminated quoted Git path')
+    decoded, _ = codecs.escape_decode(path[1:-1].encode('utf-8'))
+    return decoded.decode('utf-8', errors='surrogateescape')
+  return path
+
+
+def set_filename(stats: FileStats, filename: str) -> None:
+  """Keep classifications aligned when extended headers supply a path."""
+  stats.filename = filename
+  stats.language = detect_language(filename)
+  stats.is_test = is_test_file(filename)
+  stats.is_config = is_config_file(filename)
+
+
+def parse_diff(diff_content: str) -> list[FileStats]:
+  """Parse standard a/ and b/ Git unified diffs; reject combined diffs."""
   files = []
   current_file = None
+  old_remaining = new_remaining = 0
+  hunk_pattern = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@')
+  path_pattern = re.compile(
+    r'^diff --git ("(?:[^"\\]|\\.)*"|a/.*?) ("(?:[^"\\]|\\.)*"|b/.*)$'
+  )
 
   for line in diff_content.split('\n'):
-    # New file header
-    if line.startswith('diff --git'):
+    if line.startswith(('diff --cc ', 'diff --combined ', '@@@ ')):
+      raise ValueError(
+        'Combined merge diffs are unsupported; compare two revisions'
+      )
+    if line.startswith('diff --git '):
+      if old_remaining or new_remaining:
+        raise ValueError('Truncated diff hunk')
       if current_file:
         files.append(current_file)
-      # Extract filename from "diff --git a/path b/path"
-      match = re.search(r'b/(.+)$', line)
-      if match:
-        filename = match.group(1)
-        current_file = FileStats(
-          filename=filename,
-          language=detect_language(filename),
-          is_test=is_test_file(filename),
-          is_config=is_config_file(filename),
+      # Equal unquoted paths can contain spaces and even " b/".
+      same_path = re.fullmatch(r'diff --git a/(.+) b/\1', line)
+      match = path_pattern.fullmatch(line)
+      if same_path:
+        filename = same_path.group(1)
+      elif match:
+        destination = decode_git_path(match.group(2))
+        if not destination.startswith('b/'):
+          raise ValueError('Expected standard a/ and b/ Git path prefixes')
+        filename = destination[2:]
+      else:
+        raise ValueError(
+          'Invalid Git diff header; use standard a/ and b/ prefixes'
         )
-    elif current_file:
-      if line.startswith('+') and not line.startswith('+++'):
-        current_file.additions += 1
-      elif line.startswith('-') and not line.startswith('---'):
-        current_file.deletions += 1
+      current_file = FileStats(filename=filename)
+      set_filename(current_file, filename)
+    elif current_file is not None:
+      if line.startswith('\\ No newline at end of file'):
+        continue
+      if old_remaining or new_remaining:
+        if line.startswith('+'):
+          current_file.additions += 1
+          new_remaining -= 1
+        elif line.startswith('-'):
+          current_file.deletions += 1
+          old_remaining -= 1
+        elif line.startswith(' '):
+          old_remaining -= 1
+          new_remaining -= 1
+        else:
+          raise ValueError('Invalid or truncated diff hunk')
+        if old_remaining < 0 or new_remaining < 0:
+          raise ValueError('Diff hunk counts do not match its contents')
+      elif line.startswith('@@'):
+        hunk = hunk_pattern.match(line)
+        if hunk is None:
+          raise ValueError('Invalid unified diff hunk header')
+        old_remaining = int(hunk.group(2) or '1')
+        new_remaining = int(hunk.group(4) or '1')
+      elif line.startswith('+++ '):
+        destination = decode_git_path(line[4:].split('\t', 1)[0])
+        if destination != '/dev/null':
+          if not destination.startswith('b/'):
+            raise ValueError('Expected b/ destination prefix')
+          set_filename(current_file, destination[2:])
+      elif line.startswith('rename to '):
+        set_filename(current_file, decode_git_path(line[len('rename to ') :]))
+      elif line.startswith('copy to '):
+        set_filename(current_file, decode_git_path(line[len('copy to ') :]))
 
+  if old_remaining or new_remaining:
+    raise ValueError('Truncated diff hunk')
   if current_file:
     files.append(current_file)
 
   return files
 
 
-def calculate_complexity(files: List[FileStats]) -> float:
-  """Calculate complexity score (0-1 scale)."""
+def calculate_complexity(files: list[FileStats]) -> float:
+  """Calculate a size-based review heuristic (not semantic complexity)."""
   if not files:
     return 0.0
 
@@ -150,7 +222,7 @@ def calculate_complexity(files: List[FileStats]) -> float:
   non_test_ratio = 1 - (test_lines / max(total_changes, 1))
 
   # Factor for language diversity
-  languages = set(f.language for f in files if f.language != 'unknown')
+  languages = {f.language for f in files if f.language != 'unknown'}
   lang_factor = min(len(languages) / 5, 1.0)
 
   complexity = (
@@ -177,7 +249,7 @@ def categorize_size(total_changes: int) -> str:
     return 'XL (Extra Large) - Consider splitting'
 
 
-def estimate_review_time(files: List[FileStats], complexity: float) -> int:
+def estimate_review_time(files: list[FileStats], complexity: float) -> int:
   """Estimate review time in minutes."""
   total_changes = sum(f.additions + f.deletions for f in files)
 
@@ -191,7 +263,7 @@ def estimate_review_time(files: List[FileStats], complexity: float) -> int:
   return max(5, min(120, int(adjusted_time)))
 
 
-def identify_risk_factors(files: List[FileStats]) -> List[str]:
+def identify_risk_factors(files: list[FileStats]) -> list[str]:
   """Identify potential risk factors in the PR."""
   risks = []
 
@@ -205,10 +277,6 @@ def identify_risk_factors(files: List[FileStats]) -> List[str]:
   # No tests
   if test_changes == 0 and total_changes > 50:
     risks.append('No test changes - verify test coverage')
-
-  # Low test ratio
-  if total_changes > 100 and test_changes / max(total_changes, 1) < 0.2:
-    risks.append('Low test ratio (<20%) - consider adding more tests')
 
   # Security-sensitive files
   security_patterns = [
@@ -239,8 +307,8 @@ def identify_risk_factors(files: List[FileStats]) -> List[str]:
 
 
 def generate_suggestions(
-  files: List[FileStats], complexity: float, risks: List[str]
-) -> List[str]:
+  files: list[FileStats], complexity: float, risks: list[str]
+) -> list[str]:
   """Generate review suggestions."""
   suggestions = []
 
@@ -256,16 +324,14 @@ def generate_suggestions(
     suggestions.append('Consider pair reviewing for critical sections')
 
   if 'No test changes' in str(risks):
-    suggestions.append('Request test additions before approval')
+    suggestions.append(
+      'Inspect existing tests for changed behavior; diff counts do not measure coverage'
+    )
 
   # Language-specific suggestions
-  languages = set(f.language for f in files)
+  languages = {f.language for f in files}
   if 'TypeScript' in languages or 'TypeScript/React' in languages:
     suggestions.append("Check for proper type usage (avoid 'any')")
-  if 'Rust' in languages:
-    suggestions.append('Check for unwrap() usage and error handling')
-  if 'C' in languages or 'C++' in languages or 'C/C++' in languages:
-    suggestions.append('Check for memory safety, bounds checks, and UB risks')
   if 'SQL' in languages:
     suggestions.append('Review for SQL injection and query performance')
 
@@ -278,6 +344,8 @@ def generate_suggestions(
 def analyze_pr(diff_content: str) -> PRAnalysis:
   """Perform complete PR analysis."""
   files = parse_diff(diff_content)
+  if diff_content.strip() and not files:
+    raise ValueError('No Git unified diff found')
 
   total_additions = sum(f.additions for f in files)
   total_deletions = sum(f.deletions for f in files)
@@ -304,6 +372,9 @@ def print_analysis(analysis: PRAnalysis, show_files: bool = False):
   """Print analysis results."""
   print('\n' + '=' * 60)
   print('PR ANALYSIS REPORT')
+  print(
+    'Size-based heuristics only; not measured complexity, coverage, or merge criteria.'
+  )
   print('=' * 60)
 
   print('\n📊 SUMMARY')
@@ -330,7 +401,7 @@ def print_analysis(analysis: PRAnalysis, show_files: bool = False):
   if show_files:
     print('\n📁 FILES:')
     # Group by language
-    by_lang: Dict[str, List[FileStats]] = defaultdict(list)
+    by_lang: dict[str, list[FileStats]] = defaultdict(list)
     for f in analysis.files:
       by_lang[f.language].append(f)
 
@@ -344,7 +415,9 @@ def print_analysis(analysis: PRAnalysis, show_files: bool = False):
 
 
 def main():
-  parser = argparse.ArgumentParser(description='Analyze PR complexity')
+  parser = argparse.ArgumentParser(
+    description='Inventory a Git unified diff (size-based heuristics)'
+  )
   parser.add_argument('--diff-file', '-f', help='Path to diff file')
   parser.add_argument(
     '--stats', '-s', action='store_true', help='Show file details'
@@ -352,21 +425,27 @@ def main():
   args = parser.parse_args()
 
   # Read diff from file or stdin
-  if args.diff_file:
-    with open(args.diff_file, 'r') as f:
-      diff_content = f.read()
-  elif not sys.stdin.isatty():
-    diff_content = sys.stdin.read()
-  else:
-    print('Usage: git diff develop...HEAD | python pr-analyzer.py')
-    print('       python pr-analyzer.py -f diff.txt')
-    sys.exit(1)
+  try:
+    if args.diff_file:
+      with open(
+        args.diff_file, encoding='utf-8', errors='surrogateescape'
+      ) as f:
+        diff_content = f.read()
+    elif not sys.stdin.isatty():
+      diff_content = sys.stdin.read()
+    else:
+      parser.error('Pass --diff-file FILE or pipe a Git unified diff on stdin')
+  except (OSError, UnicodeError) as exc:
+    parser.error(str(exc))
 
   if not diff_content.strip():
-    print('No diff content provided')
-    sys.exit(1)
+    print('No changes to analyze')
+    return
 
-  analysis = analyze_pr(diff_content)
+  try:
+    analysis = analyze_pr(diff_content)
+  except (ValueError, UnicodeError) as exc:
+    parser.error(str(exc))
   print_analysis(analysis, show_files=args.stats)
 
 

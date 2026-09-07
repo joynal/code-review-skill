@@ -1,549 +1,96 @@
-# TypeScript/JavaScript Code Review Guide
+# TypeScript and JavaScript Review Guide
 
-TypeScript code review guide, covering type system, generics, conditional types, strict mode, async/await patterns, and other core topics.
+Inspect the resolved compiler version, effective tsconfig (including inherited settings), runtime version, module format, and build pipeline. TypeScript types do not validate runtime input or provide polyfills.
 
-## Table of Contents
+## Runtime boundaries and narrowing
 
-- [Type Safety Basics](#type-safety-basics)
-- [Generic Patterns](#generic-patterns)
-- [Advanced Types](#advanced-types)
-- [Strict Mode Configuration](#strict-mode-configuration)
-- [Asynchronous Handling](#asynchronous-handling)
-- [Immutability](#immutability)
-- [ESLint Rules](#eslint-rules)
-- [Review Checklist](#review-checklist)
+- Trace external data through runtime validation before trusting it. Assertions, generics, `satisfies`, and `TypedResponse<T>` wrappers cannot establish that JSON has the advertised shape.
+- Check custom type predicates against every property they promise. A property existing does not prove its value has the required type.
+- Follow unsafe `any`, assertions, and non-null assertions to a concrete failure. Their presence alone is not a finding.
+- Check null versus absent properties, optional values, indexed access, and exhaustive handling of discriminated unions.
+- `readonly` and `as const` do not freeze objects at runtime. Copying an array does not copy its nested objects.
 
----
+### Example: an assertion does not validate a response
 
-## Type Safety Basics
-
-### Avoid using any
+Assume external data may contain `{ value: 42 }` and callers need a string:
 
 ```typescript
-// ❌ Using any defeats type safety
-function processData(data: any) {
-  return data.value;  // No type checking, may crash at runtime
+type Payload = { value: string };
+
+// Bad: the asserted return type hides invalid data from downstream callers.
+function parsePayloadBad(input: unknown): Payload {
+  return input as Payload;
 }
 
-// ✅ Use proper types
-interface DataPayload {
-  value: string;
-}
-function processData(data: DataPayload) {
-  return data.value;
-}
-
-// ✅ For unknown types, use unknown + type guards
-function processUnknown(data: unknown) {
-  if (typeof data === 'object' && data !== null && 'value' in data) {
-    return (data as { value: string }).value;
+// Good: check the value before returning the advertised type.
+function parsePayload(input: unknown): Payload {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    !("value" in input) ||
+    typeof input.value !== "string"
+  ) {
+    throw new TypeError("Expected an object with a string value");
   }
-  throw new Error('Invalid data');
+  return { value: input.value };
 }
 ```
 
-// ❌ Unsafe type assertion
+**Why:** `parsePayloadBad({ value: 42 }).value.toUpperCase()` throws at the consumer. The validated parser rejects the payload at the boundary; `{ value: "ok" }` succeeds. The `in` narrowing requires TypeScript 4.9+. An assertion can be valid after a separately established invariant; do not flag every assertion. For larger schemas, use the repository's validation approach.
+
+## Asynchronous behavior
+
+- Trace rejection handling to the caller or framework boundary. Every `async` function does not need its own `try/catch`.
+- `void save()` discards the value but does not handle rejection. Check intentional background operations for an actual error handler.
+- `forEach(async ...)` does not await its callbacks. Verify sequencing, completion, and concurrency limits.
+- `Promise.all` is correct for all-or-fail results; it rejects early without cancelling remaining work. `allSettled` suits partial success only when each rejection is handled.
+- `fetch` resolves for HTTP error responses. Check `response.ok` or explicit status handling before processing a success payload.
+- Cancellation, duplicate requests, retries, and stale results need semantics appropriate to the consumer. A signal must reach the operation to cancel it.
+- Catch values can be non-`Error`; narrow them before accessing `message`. Preserve useful error context when translating errors.
+
+### Example: discarding a Promise is not handling its rejection
+
+These alternative wrappers receive an asynchronous save operation:
 
 ```typescript
-// ❌ Unsafe type assertion
-function getLength(value: string | string[]) {
-return (value as string[]).length; // If it is string, an error will occur
+// Bad: rejection escapes when used as a synchronous event callback.
+function saveBad(save: () => Promise<void>): void {
+  void save();
 }
 
-// ✅ Use type guards
-function getLength(value: string | string[]): number {
-  if (Array.isArray(value)) {
-    return value.length;
-  }
-  return value.length;
+// Good: let an awaiting caller or framework error boundary own the failure.
+async function saveAndWait(save: () => Promise<void>): Promise<void> {
+  await save();
 }
 
-// ✅ Use in operator
-interface Dog { bark(): void }
-interface Cat { meow(): void }
-
-function speak(animal: Dog | Cat) {
-  if ('bark' in animal) {
-    animal.bark();
-  } else {
-    animal.meow();
-  }
+// Also good for intentional background work: supply an actual error handler.
+function saveInBackground(
+  save: () => Promise<void>,
+  reportError: (error: unknown) => void,
+): void {
+  void save().catch(reportError);
 }
 ```
 
-### Literal type and as const
+**Why:** with a save operation that rejects, `saveBad` leaves the rejection unhandled. `saveAndWait` exposes it to the caller, which must await/catch it; `saveInBackground` reports it. Assume the background reporter does not throw and `save` returns a Promise rather than throwing synchronously. If successful saving is required before navigation, background execution is not a suitable correction.
 
-```typescript
-// ❌ The type is too broad
-const config = {
-  endpoint: '/api',
-method: 'GET' // type is string
-};
+## Runtime and module compatibility
 
-// ✅ Use as const to get the literal type
-const config = {
-  endpoint: '/api',
-  method: 'GET'
-} as const; // method type is 'GET'
+- Confirm `target`, `lib`, `module`, and `moduleResolution` match the runtime/bundler. A DOM type being available does not make a browser API exist on the server.
+- Check package `exports`, `type`, extension requirements, and type-only imports at ESM/CommonJS boundaries.
+- For shared packages, validate declarations and emitted code against their promised consumer versions.
+- New compiler errors from dependency declarations may require aligned library or `@types` versions, not a broad `skipLibCheck` change.
 
-// ✅ for function parameters
-function request(method: 'GET' | 'POST', url: string) { ... }
-request(config.method, config.endpoint); // Correct!
-```
+## Compiler migrations
 
----
+Version-sensitive changes should be reviewed against their actual target release:
 
-// ❌ Repeat code
+- TypeScript 6 changes defaults including `strict`, `types`, and `rootDir`; check ambient type availability and emitted directory layout. Deprecated options such as `baseUrl` and legacy module resolution need migration. See [6.0 release notes](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-6-0.html).
+- TypeScript 7 uses the native compiler and 7.0 does not ship a compiler API. Check platform/tooling support and libraries that import the old API, use custom transformers, or integrate the language service. Some tools need TypeScript 6 alongside 7. CLI compilation compatibility does not imply compiler API compatibility. See [7.0 release announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/).
+- `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes` provide checks beyond `strict`. Evaluate enabling them as a scoped configuration change, not a prerequisite for every PR.
 
-### Basic generics
+## Tooling and tests
 
-```typescript
-// ❌ Repeat code
-function getFirstString(arr: string[]): string | undefined {
-  return arr[0];
-}
-function getFirstNumber(arr: number[]): number | undefined {
-  return arr[0];
-}
+Use configured typecheck, lint, and test commands. For new typescript-eslint configurations, consult [typed linting](https://typescript-eslint.io/getting-started/typed-linting/) for flat config, type-aware presets, and `projectService`; check supported compiler versions before adopting them. Avoid imposing a replacement linter setup during an unrelated review.
 
-// ✅ Use generics
-function getFirst<T>(arr: T[]): T | undefined {
-  return arr[0];
-}
-```
-
-### Generic constraints
-
-```typescript
-// ❌ Generics have no constraints and cannot access properties
-function getProperty<T>(obj: T, key: string) {
-return obj[key]; // Error: cannot index
-}
-
-// ✅ Use keyof constraints
-function getProperty<T, K extends keyof T>(obj: T, key: K): T[K] {
-  return obj[key];
-}
-
-const user = { name: 'Alice', age: 30 };
-getProperty(user, 'name'); // The return type is string
-getProperty(user, 'foo'); // Error: 'foo' is not in keyof User
-getProperty(user, 'foo'); // Error: 'foo' is not in keyof User
-```
-
-### Generic default value
-
-```typescript
-// You can not specify generic parameters
-interface ApiResponse<T = unknown> {
-  data: T;
-  status: number;
-  message: string;
-}
-
-// You can not specify generic parameters
-const response: ApiResponse = { data: null, status: 200, message: 'OK' };
-// You can also specify
-const userResponse: ApiResponse<User> = { ... };
-```
-
-### Common generic tool types
-
-```typescript
-// ✅ Make good use of built-in tool types
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-type PartialUser = Partial<User>; // All attributes are optional
-type RequiredUser = Required<User>; // All properties are required
-type ReadonlyUser = Readonly<User>; // All properties are read-only
-type UserKeys = keyof User;               // 'id' | 'name' | 'email'
-type NameOnly = Pick<User, 'name'>;       // { name: string }
-type WithoutId = Omit<User, 'id'>;        // { name: string; email: string }
-type UserRecord = Record<string, User>;   // { [key: string]: User }
-```
-
----
-
-## Advanced types
-
-### Condition type
-
-```typescript
-// ✅ Extract function return type (built-in ReturnType)
-type IsString<T> = T extends string ? true : false;
-
-type A = IsString<string>;  // true
-type B = IsString<number>;  // false
-
-// ✅ Extract function return type (built-in ReturnType)
-type ElementType<T> = T extends (infer U)[] ? U : never;
-
-type Elem = ElementType<string[]>;  // string
-
-// ✅ Extract function return type (built-in ReturnType)
-type MyReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
-```
-
-### Mapping type
-
-```typescript
-// ✅ Convert all properties of the object type
-type Nullable<T> = {
-  [K in keyof T]: T[K] | null;
-};
-
-interface User {
-  name: string;
-  age: number;
-}
-
-type NullableUser = Nullable<User>;
-// { name: string | null; age: number | null }
-
-// ✅ API route type
-type Getters<T> = {
-  [K in keyof T as `get${Capitalize<string & K>}`]: () => T[K];
-};
-
-type UserGetters = Getters<User>;
-// { getName: () => string; getAge: () => number }
-```
-
-### Template literal type
-
-```typescript
-// ✅ Type-safe event name
-type EventName = 'click' | 'focus' | 'blur';
-type HandlerName = `on${Capitalize<EventName>}`;
-// 'onClick' | 'onFocus' | 'onBlur'
-
-// ✅ API route type
-type ApiRoute = `/api/${string}`;
-const route: ApiRoute = '/api/users';  // OK
-const badRoute: ApiRoute = '/users';   // Error
-```
-
-### Discriminated Unions
-
-```typescript
-// ✅ Use discriminant properties to achieve type safety
-type Result<T, E> =
-  | { success: true; data: T }
-  | { success: false; error: E };
-
-function handleResult(result: Result<User, Error>) {
-  if (result.success) {
-console.log(result.data.name); // TypeScript knows that data exists
-  } else {
-console.log(result.error.message); // TypeScript knows error exists
-  }
-}
-
-// ✅ Redux Action mode
-type Action =
-  | { type: 'INCREMENT'; payload: number }
-  | { type: 'DECREMENT'; payload: number }
-  | { type: 'RESET' };
-
-function reducer(state: number, action: Action): number {
-  switch (action.type) {
-    case 'INCREMENT':
-return 0; // No payload here
-    case 'DECREMENT':
-      return state - action.payload;
-    case 'RESET':
-return 0; // No payload here
-  }
-}
-```
-
----
-
-## Strict mode configuration
-
-### Recommended tsconfig.json
-
-```json
-{
-  "compilerOptions": {
-// ✅ The strict option must be turned on
-    "strict": true,
-    "noImplicitAny": true,
-    "strictNullChecks": true,
-    "strictFunctionTypes": true,
-    "strictBindCallApply": true,
-    "strictPropertyInitialization": true,
-    "noImplicitThis": true,
-    "useUnknownInCatchVariables": true,
-
-// ✅ Additional recommended options
-    "noUncheckedIndexedAccess": true,
-    "noImplicitReturns": true,
-    "noFallthroughCasesInSwitch": true,
-    "exactOptionalPropertyTypes": true,
-    "noPropertyAccessFromIndexSignature": true
-  }
-}
-```
-
-### Impact of noUncheckedIndexedAccess
-
-```typescript
-// tsconfig: "noUncheckedIndexedAccess": true
-
-const arr = [1, 2, 3];
-const first = arr[0]; // type is number | undefined
-
-// ❌ Direct use may cause errors
-// ✅ Check first
-
-// ✅ Check first
-if (first !== undefined) {
-  console.log(first.toFixed(2));
-}
-
-// ✅ Or use non-null assertion (when determined)
-console.log(arr[0]!.toFixed(2));
-```
-
----
-
-### Promise error handling
-
-// ❌ Promise.all If one fails, all fail
-
-```typescript
-// ❌ Not handling async errors
-async function fetchUser(id: string) {
-  const response = await fetch(`/api/users/${id}`);
-return response.json(); // Network error not handled
-}
-
-// ✅ Handle errors properly
-async function fetchUser(id: string): Promise<User> {
-  try {
-    const response = await fetch(`/api/users/${id}`);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-    return await response.json();
-  } catch (error) {
-    if (error instanceof Error) {
-      throw new Error(`Failed to fetch user: ${error.message}`);
-    }
-    throw error;
-  }
-}
-```
-
-### Promise.all vs Promise.allSettled
-
-```typescript
-// ❌ Promise.all If one fails, all fail
-async function fetchAllUsers(ids: string[]) {
-  const users = await Promise.all(ids.map(fetchUser));
-return users; // If one fails, all fail
-}
-
-// ✅ Promise.allSettled Get all results
-async function fetchAllUsers(ids: string[]) {
-  const results = await Promise.allSettled(ids.map(fetchUser));
-
-  const users: User[] = [];
-  const errors: Error[] = [];
-
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      users.push(result.value);
-    } else {
-      errors.push(result.reason);
-    }
-  }
-
-  return { users, errors };
-}
-```
-
-### Race condition handling
-
-```typescript
-.then(setResults); // Old requests may be returned later!
-function useSearch() {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
-
-  useEffect(() => {
-    fetch(`/api/search?q=${query}`)
-      .then(r => r.json())
-.then(setResults); // Old requests may be returned later!
-  }, [query]);
-}
-
-// ✅ Use AbortController
-function useSearch() {
-  const [query, setQuery] = useState('');
-  const [results, setResults] = useState([]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-
-    fetch(`/api/search?q=${query}`, { signal: controller.signal })
-      .then(r => r.json())
-      .then(setResults)
-      .catch(e => {
-        if (e.name !== 'AbortError') throw e;
-      });
-
-    return () => controller.abort();
-  }, [query]);
-}
-```
-
----
-
-## Immutability
-
-### Readonly and ReadonlyArray
-
-```typescript
-// ✅ Use readonly to prevent modifications
-function processUsers(users: User[]) {
-users.sort((a, b) => a.name.localeCompare(b.name)); // The original array has been modified!
-  return users;
-}
-
-// ✅ Use readonly to prevent modifications
-function processUsers(users: readonly User[]): User[] {
-  return [...users].sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// ✅ Depth read-only
-type DeepReadonly<T> = {
-  readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];
-};
-```
-
-### Invariant function parameters
-
-```typescript
-// ✅ Use as const and readonly to protect data
-function createConfig<T extends readonly string[]>(routes: T) {
-  return routes;
-}
-
-const routes = createConfig(['home', 'about', 'contact'] as const);
-// The type is readonly ['home', 'about', 'contact']
-```
-
----
-
-## ESLint rules
-
-// ✅ Type safety
-
-```javascript
-// .eslintrc.js
-module.exports = {
-  extends: [
-    'eslint:recommended',
-    'plugin:@typescript-eslint/recommended',
-    'plugin:@typescript-eslint/recommended-requiring-type-checking',
-    'plugin:@typescript-eslint/strict'
-  ],
-  rules: {
-// ✅ Type safety
-    '@typescript-eslint/no-explicit-any': 'error',
-    '@typescript-eslint/no-unsafe-assignment': 'error',
-    '@typescript-eslint/no-unsafe-member-access': 'error',
-    '@typescript-eslint/no-unsafe-call': 'error',
-    '@typescript-eslint/no-unsafe-return': 'error',
-
-// ✅ Code style
-    '@typescript-eslint/explicit-function-return-type': 'warn',
-    '@typescript-eslint/no-floating-promises': 'error',
-    '@typescript-eslint/await-thenable': 'error',
-    '@typescript-eslint/no-misused-promises': 'error',
-
-// ✅ Code style
-    '@typescript-eslint/consistent-type-imports': 'error',
-    '@typescript-eslint/prefer-nullish-coalescing': 'error',
-    '@typescript-eslint/prefer-optional-chain': 'error'
-  }
-};
-```
-
-### Common ESLint bug fixes
-
-```typescript
-// ❌ no-floating-promises: Promise must be handled
-async function save() { ... }
-save(); // Error: Unhandled Promise
-
-// ✅ Explicit processing
-await save();
-// Or explicitly ignore
-save().catch(console.error);
-// Or explicitly ignore
-void save();
-
-// ❌ no-misused-promises: Promises cannot be used in non-async locations
-const items = [1, 2, 3];
-items.forEach(async (item) => {  // Error!
-  await processItem(item);
-});
-
-// ✅ Use for...of
-for (const item of items) {
-  await processItem(item);
-}
-// or Promise.all
-await Promise.all(items.map(processItem));
-```
-
----
-
-## Review Checklist
-
-### Type system
-
-- [ ] No use of `any` (use `unknown` + type guards instead)
-- [ ] Complete and meaningful naming of interfaces and types
-- [ ] Use generics to improve code reusability
-- [ ] union types have correct type narrowing
-- [ ] Make good use of tool types (Partial, Pick, Omit, etc.)
-
-### Generics
-
-- [ ] Generics have appropriate constraints (extends)
-- [ ] Generic parameters have sensible default values
-- [ ] Avoid overgeneralization (KISS principle)
-
-### Strict mode
-
-- [ ] tsconfig.json enabled strict: true
-- [ ] noUncheckedIndexedAccess enabled
-- [ ] Do not use @ts-ignore (use @ts-expect-error instead)
-
-### Asynchronous code
-
-- [ ] async function has error handling
-- [ ] Promise rejection is handled correctly
-- [ ] No floating promises (unhandled Promise)
-- [ ] Use Promise.all or Promise.allSettled for concurrent requests
-- [ ] Race conditions are handled using AbortController
-
-### Immutability
-
-- [ ] Do not modify function parameters directly
-- [ ] Create new objects/arrays using spread operator
-- [ ] Consider using the readonly modifier
-
-### ESLint
-
-- [ ] Use @typescript-eslint/recommended
-- [ ] No ESLint warnings or errors
-- [ ] Use consistent-type-imports
+Prioritize tests at runtime boundaries: malformed data, missing optional fields, HTTP errors, partial failures, and operations finishing out of order.

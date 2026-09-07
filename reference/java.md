@@ -1,376 +1,103 @@
-# Java Code Review Guide
+# Java Review Guide
 
-## Table of contents
+Inspect the JDK runtime, compiler `--release`/toolchain, Maven or Gradle configuration, Spring/Boot version, and deployment baseline. Do not equate a local JDK upgrade with application compatibility.
 
-- [Java Code Review Guide](#java-code-review-guide)
-  - [Table of contents](#table-of-contents)
-  - [Modern Java Features (17/21+)](#modern-java-features-1721)
-    - [Record (record class)](#record-record-class)
-    - [Switch expression and pattern matching](#switch-expression-and-pattern-matching)
-    - [Text Blocks](#text-blocks)
-  - [Stream API \& Optional](#stream-api--optional)
-    - [Avoid abusing Stream](#avoid-abusing-stream)
-    - [Optional Correct usage](#optional-correct-usage)
-  - [JPA and database performance](#jpa-and-database-performance)
-    - [Transaction Management](#transaction-management)
-    - [Entity Design](#entity-design)
-    - [Virtual threads (Java 21+)](#virtual-threads-java-21)
-    - [Thread safety](#thread-safety)
-  - [Lombok usage specifications](#lombok-usage-specifications)
-  - [Exception handling](#exception-handling)
-    - [Global exception handling](#global-exception-handling)
-  - [Test specifications](#test-specifications)
-    - [Unit testing vs integration testing](#unit-testing-vs-integration-testing)
-  - [Review Checklist](#review-checklist)
-    - [Basics and Specifications](#basics-and-specifications)
-    - [Spring Boot](#spring-boot)
-    - [Database \& Transactions](#database--transactions)
-    - [Concurrency and performance](#concurrency-and-performance)
-    - [Maintainability](#maintainability)
+## Language and API contracts
 
----
+- Records have final component fields, but referenced collections can still be mutable. Check defensive copies where immutability is part of the contract.
+- Pattern matching for `instanceof` became final in Java 16; pattern matching for `switch` became final in Java 21. Distinguish final and preview features and confirm build/runtime flags.
+- Verify null handling in switches and exhaustiveness across sealed hierarchies.
+- `Stream.toList()` produces an unmodifiable list. Check downstream mutation when replacing collection code.
+- `Optional.orElse` evaluates its argument eagerly; use lazy fallback when the work or side effects should happen only if absent.
+- Streams, conventional loops, POJOs, records, and constructor injection are design choices; identify behavioral or contractual consequences before reporting a defect.
 
-## Modern Java Features (17/21+)
+## Spring, persistence, and transactions
 
-### Record (record class)
+- In proxy-based Spring transaction management, self-invocation bypasses the proxy. Verify interception and method visibility for the actual proxy/framework version.
+- Check rollback rules for checked exceptions and any configured overrides. `readOnly = true` is a hint, not authorization or a universal prohibition on writes.
+- Trace transactions across async work, network calls, and retries. Check connection lifetime and partial-commit behavior.
+- Inspect actual ORM queries for N+1 behavior. Fetch joins and entity graphs can affect row cardinality and pagination; a join may omit parents without matching children.
+- Entity equality/hash codes must remain valid for proxies, transient objects, and generated IDs. Generated methods traversing relationships can recurse or load data unexpectedly.
+- Validate inbound DTOs and authorization separately from persistence constraints. Global handlers should not leak internal errors.
+
+See [Spring transaction semantics](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html) for version-specific interception and rollback behavior.
+
+## Threads and resource lifetime
+
+- Virtual threads are final in Java 21+. They help blocking workloads but do not make CPU work faster or increase database pool capacity.
+- Limit access to scarce downstream resources even when creating virtual threads cheaply.
+- Monitor pinning guidance is version-sensitive: Java 24's JEP 491 removes pinning for most `synchronized` blocking. Do not apply an old blanket prohibition to newer JDKs. See [JEP 491](https://openjdk.org/jeps/491).
+- Preserve interruption or propagate it appropriately when catching `InterruptedException`.
+- Check executor shutdown, try-with-resources, thread-local lifetime, and shared mutable state.
+- `ConcurrentHashMap` does not automatically make multi-step business operations atomic.
+
+## Focused examples
+
+### Records are only shallowly immutable (Java 16+)
+
+The contract here is a snapshot of role names. These declarations can be placed in separate files or nested in a test class.
 
 ```java
-// ❌ Traditional POJO/DTO: lots of boilerplate code
-public class UserDto {
-    private final String name;
-    private final int age;
+import java.util.List;
 
-    public UserDto(String name, int age) {
-        this.name = name;
-        this.age = age;
-    }
-    // getters, equals, hashCode, toString...
-}
+// Bad: the caller can change the record's roles through its original list.
+record RolesBad(List<String> values) {}
 
-// ✅ Use Record: concise, immutable, clear semantics
-public record UserDto(String name, int age) {
-// Compact constructor for verification
-    public UserDto {
-        if (age < 0) throw new IllegalArgumentException("Age cannot be negative");
+// Good: store an unmodifiable snapshot of the supplied role names.
+record RolesGood(List<String> values) {
+    RolesGood {
+        values = List.copyOf(values);
     }
 }
 ```
 
-### Switch expression and pattern matching
+**Why:** construct either record with a mutable list, then append a role to the original list. The bad record changes; the good one does not. The good accessor also rejects list mutation. `List.copyOf` rejects null elements and does not deep-copy them; this example's strings are immutable. If nulls or shared mutation are part of the API contract, this correction would change that contract. See [List.copyOf](https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/util/List.html).
+
+### A transactional method bypassed by self-invocation
+
+Assume Spring's default proxy-based transaction management, no transaction on the external caller, and two repository writes that must commit together. These are alternative versions of the same Spring-managed service; `LedgerRepository` supplies the application's two write methods.
 
 ```java
-// ❌ Traditional Switch: easy to miss break, not only lengthy and error-prone
-String type = "";
-switch (obj) {
-    case Integer i: // Java 16+
-        type = String.format("int %d", i);
-        break;
-    case String s:
-        type = String.format("string %s", s);
-        break;
-    default:
-        type = "unknown";
-}
-
-// ✅ Switch expression: no penetration risk, forced return value
-String type = switch (obj) {
-    case Integer i -> "int %d".formatted(i);
-    case String s  -> "string %s".formatted(s);
-case null -> "null value"; // Java 21 handles null
-    default        -> "unknown";
-};
-```
-
-### Text Blocks
-
-```java
-// ❌ Concatenate SQL/JSON strings
-String json = "{\n" +
-              "  \"name\": \"Alice\",\n" +
-              "  \"age\": 20\n" +
-              "}";
-
-// ✅ Use text blocks: what you see is what you get
-String json = """
-    {
-      "name": "Alice",
-      "age": 20
-    }
-    """;
-```
-
----
-
-## Stream API & Optional
-
-### Avoid abusing Stream
-
-```java
-// ✅ Use for-each directly in simple scenarios
-items.stream().forEach(item -> {
-    process(item);
-});
-
-// ✅ Use for-each directly in simple scenarios
-for (var item : items) {
-    process(item);
-}
-
-// ❌ Extremely complex Stream chain
-List<Dto> result = list.stream()
-    .filter(...)
-    .map(...)
-    .peek(...)
-    .sorted(...)
-.collect(...); // Difficult to debug
-
-// ✅ Split into meaningful steps
-var filtered = list.stream().filter(...).toList();
-// ...
-```
-
-### Optional Correct usage
-
-```java
-// ❌ Use Optional as a parameter or field (serialization problem, increase calling complexity)
-public void process(Optional<String> name) { ... }
-public class User {
-private Optional<String> email; // Not recommended
-}
-
-// ✅ Optional is only used to return values
-public Optional<User> findUser(String id) { ... }
-
-// ❌ Now that Optional is used, still use isPresent() + get()
-Optional<User> userOpt = findUser(id);
-if (userOpt.isPresent()) {
-    return userOpt.get().getName();
-} else {
-    return "Unknown";
-}
-
-// ✅ Use functional API
-return findUser(id)
-    .map(User::getName)
-    .orElse("Unknown");
-```
-
----
-
-## JPA and database performance
-
-// ❌ FetchType.EAGER or trigger lazy loading in a loop
-
-```java
-// ❌ FetchType.EAGER or trigger lazy loading in a loop
-// Entity definition
-@Entity
-public class User {
-@OneToMany(fetch = FetchType.EAGER) // Danger!
-    private List<Order> orders;
-}
-
-//Business code
-List<User> users = userRepo.findAll(); // 1 SQL
-for (User user : users) {
-// If it is Lazy, N SQLs will be triggered here
-    System.out.println(user.getOrders().size());
-}
-
-// ✅ Use @EntityGraph or JOIN FETCH
-@Query("SELECT u FROM User u JOIN FETCH u.orders")
-List<User> findAllWithOrders();
-```
-
-### Transaction Management
-
-```java
-// ❌ Start transactions at the Controller layer (the database connection takes too long)
-// ✅ Add @Transactional to the public method of the Service layer
-@Transactional
-private void saveInternal() { ... }
-
-// ✅ Add @Transactional to the public method of the Service layer
-// ✅ Read operations are explicitly marked readOnly = true (performance optimization)
+// Bad: an external call to transfer reaches writeBoth through "this",
+// bypassing the proxy advice on writeBoth.
 @Service
-public class UserService {
-    @Transactional(readOnly = true)
-    public User getUser(Long id) { ... }
+class TransferServiceBad {
+    private final LedgerRepository ledger;
+
+    TransferServiceBad(LedgerRepository ledger) { this.ledger = ledger; }
+
+    public void transfer() { writeBoth(); }
 
     @Transactional
-    public void createUser(UserDto dto) { ... }
-}
-```
-
-### Entity Design
-
-```java
-// ❌ Use Lombok @Data in Entity
-// The equals/hashCode generated by @Data contains all fields, which may trigger lazy loading and cause performance problems or exceptions.
-@Entity
-@Data
-public class User { ... }
-
-// ✅ Only use @Getter, @Setter
-### Virtual threads (Java 21+)
-@Entity
-@Getter
-@Setter
-public class User {
-    @Id
-    private Long id;
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (!(o instanceof User)) return false;
-        return id != null && id.equals(((User) o).id);
+    public void writeBoth() {
+        ledger.debit();
+        ledger.credit();
     }
+}
 
-    @Override
-    public int hashCode() {
-        return getClass().hashCode();
+// Good: the externally invoked entrypoint establishes the transaction.
+@Service
+class TransferServiceGood {
+    private final LedgerRepository ledger;
+
+    TransferServiceGood(LedgerRepository ledger) { this.ledger = ledger; }
+
+    @Transactional
+    public void transfer() {
+        ledger.debit();
+        ledger.credit();
     }
 }
 ```
 
----
+Use Spring's `org.springframework.stereotype.Service` and `org.springframework.transaction.annotation.Transactional` imports.
 
-### Virtual threads (Java 21+)
+**Why:** an external call through the good service's proxy wraps both writes in one transaction. Verify rollback by making the second write throw a runtime exception against the actual transactional store. An already-transactional caller or AspectJ weaving changes the analysis; self-invocation alone is not proof of a partial commit. Checked exceptions may require explicit rollback rules. See [Spring transaction semantics](https://docs.spring.io/spring-framework/reference/data-access/transaction/declarative/annotations.html).
 
-```java
-// ❌ Traditional thread pool handles a large number of I/O blocking tasks (resource exhaustion)
-ExecutorService executor = Executors.newFixedThreadPool(100);
+## Upgrades and validation
 
-// ✅ Use virtual threads to handle I/O-intensive tasks (high throughput)
-// Spring Boot 3.2+ enabled: spring.threads.virtual.enabled=true
-ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+For Spring Boot 3-to-4 changes, check the modularized starters, Jackson migration, removed deprecated APIs, and test dependencies against the [Boot 4 migration guide](https://github.com/spring-projects/spring-boot/wiki/Spring-Boot-4.0-Migration-Guide). Confirm the chosen minor version's [system requirements](https://docs.spring.io/spring-boot/system-requirements.html); do not require the same JDK as the latest feature release.
 
-// In virtual threads, blocking operations (such as DB queries, HTTP requests) consume almost no OS thread resources
-```
+Check dependency compatibility, bytecode targets, annotation processors (including Lombok), serialization, and integration-test images. Match database tests to supported deployment versions rather than an arbitrary sample image.
 
-### Thread safety
-
-```java
-// ❌ HashMap may have an infinite loop or data loss in a multi-threaded environment
-private static final SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd");
-
-// ✅ Use DateTimeFormatter (Java 8+)
-private static final DateTimeFormatter dtf = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-
-// ❌ HashMap may have an infinite loop or data loss in a multi-threaded environment
-// ✅ Use ConcurrentHashMap
-Map<String, String> cache = new ConcurrentHashMap<>();
-```
-
----
-
-## Lombok usage specifications
-
-```java
-// ❌ Abusing @Builder results in the inability to force verification of required fields
-@Builder
-public class Order {
-private String id; // required
-private String note; // optional
-}
-// Caller may miss id: Order.builder().note("hi").build();
-
-// ✅ For key business objects, it is recommended to manually write the Builder or constructor to ensure invariants
-// Or add verification logic (Lombok @Builder.Default, etc.) in the build() method
-```
-
----
-
-## Exception handling
-
-### Global exception handling
-
-```java
-e.printStackTrace(); // Should not be used in production environments
-try {
-    userService.create(user);
-} catch (Exception e) {
-e.printStackTrace(); // Should not be used in production environments
-// return null; // Swallow the exception, the upper layer does not know what happened
-}
-
-// ✅ Custom exception + @ControllerAdvice (Spring Boot 3 ProblemDetail)
-public class UserNotFoundException extends RuntimeException { ... }
-
-@RestControllerAdvice
-public class GlobalExceptionHandler {
-    @ExceptionHandler(UserNotFoundException.class)
-    public ProblemDetail handleNotFound(UserNotFoundException e) {
-        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
-    }
-}
-```
-
----
-
-## Test specifications
-
-### Unit testing vs integration testing
-
-```java
-@SpringBootTest // Start the entire Context, slow
-@SpringBootTest // Start the entire Context, slow
-public class UserServiceTest { ... }
-
-// ✅ Unit testing uses Mockito
-@ExtendWith(MockitoExtension.class)
-class UserServiceTest {
-    @Mock UserRepository repo;
-    @InjectMocks UserService service;
-
-    @Test
-    void shouldCreateUser() { ... }
-}
-
-// ✅ Integration testing uses Testcontainers
-@Testcontainers
-@SpringBootTest
-class UserRepositoryTest {
-    @Container
-    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:15");
-    // ...
-}
-```
-
----
-
-## Review Checklist
-
-### Basics and Specifications
-
-- [ ] Comply with Java 17/21 new features (Switch expressions, Records, text blocks)
-- [ ] Avoid using obsolete classes (Date, Calendar, SimpleDateFormat)
-- [ ] Are the Stream API or Collections methods preferred for collection operations?
-- [ ] Configuration properties use @ConfigurationProperties
-
-### Spring Boot
-
-- [ ] Use constructor injection instead of @Autowired field injection
-- [ ] Configuration properties use @ConfigurationProperties
-- [ ] Controller has a single responsibility and business logic is transferred to Service
-- [ ] Global exception handling uses @ControllerAdvice / ProblemDetail
-
-### Database & Transactions
-
-- [ ] The read operation transaction is marked `@Transactional(readOnly = true)`
-- [ ] Check if N+1 query exists (EAGER fetch or loop call)
-- [ ] Entity class does not use @Data and implements equals/hashCode correctly
-- [ ] Whether the database index covers the query conditions
-
-### Concurrency and performance
-
-- [ ] Are virtual threads considered for I/O intensive tasks?
-- [ ] Whether thread safety classes are used correctly (ConcurrentHashMap vs HashMap)
-- [ ] Is the lock granularity reasonable? Avoid I/O operations inside locks
-
-### Maintainability
-
-- [ ] Key business logic has adequate unit testing
-- [ ] Logging properly (use Slf4j, avoid System.out)
-- [ ] Magic value extracted as constant or enumeration
+Java 25 is an LTS baseline and Java 26 is a later feature release; deployment support and framework compatibility determine the appropriate target. See [Java releases](https://www.oracle.com/java/technologies/downloads/). Test the affected behavior with the existing unit and integration setup; full-context tests are appropriate when wiring or transactions are the subject.

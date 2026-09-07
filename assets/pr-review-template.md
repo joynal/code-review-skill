@@ -1,114 +1,21 @@
-# PR Review Template
+# Code Review
 
-Copy and use this template for your code reviews.
+Use this only when the user or host has not prescribed another format. Remove unused sections and replace placeholders. Use the priority definitions in [SKILL.md](../SKILL.md).
 
----
+## Findings
 
-## Summary
+### [P2] Short, actionable title
 
-[Brief overview of what was reviewed - 1-2 sentences]
+**Location:** `path/to/file:line`
 
-**PR Size:** [Small/Medium/Large] (~X lines)
-**Review Time:** [X minutes]
+Describe the concrete trigger, resulting failure, and affected caller or user. Explain the correction briefly, with a reproduction or supporting evidence when available.
 
-## Strengths
+Repeat only for independent findings. If there are none, write “No actionable findings found.”
 
-- [What was done well]
-- [Good patterns or approaches used]
-- [Improvements from previous code]
+## Open questions
 
-## Required Changes
+Include only uncertainties that materially affect the review. Do not present them as confirmed defects.
 
-🔴 **[blocking]** [Issue description]
-> [Code location or example]
-> [Suggested fix or explanation]
+## Scope and validation
 
-🔴 **[blocking]** [Issue description]
-> [Details]
-
-## Important Suggestions
-
-🟡 **[important]** [Issue description]
-> [Why this matters]
-> [Suggested approach]
-
-## Minor Suggestions
-
-🟢 **[nit]** [Minor improvement suggestion]
-
-💡 **[suggestion]** [Alternative approach to consider]
-
-## Questions
-
-❓ [Clarification needed about X]
-
-❓ [Question about design decision Y]
-
-## Security Considerations
-
-- [ ] No hardcoded secrets
-- [ ] Input validation present
-- [ ] Authorization checks in place
-- [ ] No SQL/XSS injection risks
-
-## Test Coverage
-
-- [ ] Unit tests added/updated
-- [ ] Edge cases covered
-- [ ] Error cases tested
-
-## Verdict
-
-**[ ] ✅ Approve** - Ready to merge
-**[ ] 💬 Comment** - Minor suggestions, can merge
-**[ ] 🔄 Request Changes** - Must address blocking issues
-
----
-
-## Quick Copy Templates
-
-### Blocking Issue
-```
-🔴 **[blocking]** [Title]
-
-[Description of the issue]
-
-**Location:** `file.ts:123`
-
-**Suggested fix:**
-\`\`\`typescript
-// Your suggested code
-\`\`\`
-```
-
-### Important Suggestion
-```
-🟡 **[important]** [Title]
-
-[Why this is important]
-
-**Consider:**
-- Option A: [description]
-- Option B: [description]
-```
-
-### Minor Suggestion
-```
-🟢 **[nit]** [Suggestion]
-
-Not blocking, but consider [improvement].
-```
-
-### Praise
-```
-🎉 **[praise]** Great work on [specific thing]!
-
-[Why this is good]
-```
-
-### Question
-```
-❓ **[question]** [Your question]
-
-I'm curious about the decision to [X]. Could you explain [Y]?
-```
+State the reviewed comparison or files, checks run and results, and material areas that could not be checked. If asked for a merge recommendation, give one supported by those findings; do not imply a PR action was submitted.

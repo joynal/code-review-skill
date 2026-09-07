@@ -1,185 +1,103 @@
-### Overview
+# Code Review Skill
 
-**Code Review** skill is a production-ready skill for [Claude Code](https://claude.ai/code) that transforms AI-assisted code review from vague suggestions into a **structured, consistent, and expert-level** process.
+A shared agent skill for **Codex and Claude Code** that reviews code for actionable bugs, security issues, performance regressions, and compatibility problems.
 
----
 
-### &#10024; Key Features
+## Install with npx skills
 
-- **Progressive Disclosure** — Core skill is ~190 lines; language guides (~200–1,000 lines each) load only when needed.
-- **Four-Phase Review Process** — Structured workflow from understanding scope to delivering clear feedback.
-- **Severity Labeling** — Every finding is categorized: `blocking` · `important` · `nit` · `suggestion` · `learning` · `praise`
-- **Security-First** — Dedicated security checklists per language ecosystem.
-- **Collaborative Tone** — Questions over commands, suggestions over mandates.
-- **Automation Awareness** — Clearly separates what human review should catch vs. what linters handle.
+From the project where you want to use the skill:
 
----
-
-### &#127760; Supported Languages & Frameworks
-
-<table>
-  <thead>
-    <tr>
-      <th>Category</th>
-      <th>Technology</th>
-      <th>Guide</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="3"><strong>Frontend</strong></td>
-      <td>&#9883;&#65039; React 19</td>
-      <td><code>reference/react.md</code></td>
-    </tr>
-    <tr>
-      <td>&#127912; CSS</td>
-      <td><code>reference/css.md</code></td>
-    </tr>
-    <tr>
-      <td>&#128311; TypeScript</td>
-      <td><code>reference/typescript.md</code></td>
-    </tr>
-    <tr>
-      <td rowspan="3"><strong>Backend</strong></td>
-      <td>&#9749; Java</td>
-      <td><code>reference/java.md</code></td>
-    </tr>
-    <tr>
-      <td>&#128013; Python</td>
-      <td><code>reference/python.md</code></td>
-    </tr>
-    <tr>
-      <td>&#128057; Go</td>
-      <td><code>reference/go.md</code></td>
-    </tr>
-    <tr>
-      <td rowspan="2"><strong>Architecture</strong></td>
-      <td>&#127963;&#65039; Architecture Design Review</td>
-      <td><code>reference/architecture-review-guide.md</code></td>
-    </tr>
-    <tr>
-      <td>&#9889; Performance Review</td>
-      <td><code>reference/performance-review-guide.md</code></td>
-    </tr>
-  </tbody>
-</table>
-
----
-
-### &#128260; The Four-Phase Review Process
-
-```
-Phase 1 - Context Gathering
-  Understand PR scope, linked issues, and intent
-                    |
-                    v
-Phase 2 - High-Level Review
-  Architecture - Performance impact - Test strategy
-                    |
-                    v
-Phase 3 - Line-by-Line Analysis
-  Logic - Security - Maintainability - Edge cases
-                    |
-                    v
-Phase 4 - Summary & Decision
-  Structured feedback - Approval status - Action items
+```sh
+npx skills add joynal/code-review-skill --skill code-review --agent codex claude-code
 ```
 
----
+Add `--global` to install for your user across projects, or specify only one agent. Node.js/npm and Git are needed for this installer; the skill itself has no Node dependency or npm package to publish.
 
-### &#127991;&#65039; Severity Labels
+List the available skill before installing:
 
-| Label                  | Meaning                                         |
-| ---------------------- | ----------------------------------------------- |
-| &#128308; `blocking`   | Must be fixed before merge                      |
-| &#128992; `important`  | Should be fixed; may block depending on context |
-| &#128993; `nit`        | Minor style or preference issue                 |
-| &#128309; `suggestion` | Optional improvement worth considering          |
-| &#128218; `learning`   | Educational note for the author                 |
-| &#127775; `praise`     | Explicitly highlight great work                 |
-
----
-
-### &#128193; Repository Structure
-
-```
-code-review-skill/
-|
-+-- SKILL.md                              # Core skill - loaded on activation (~190 lines)
-+-- README.md
-+-- LICENSE
-+-- CONTRIBUTING.md
-|
-+-- reference/                            # On-demand language guides
-|   +-- react.md                          # React 19, Server Components, Suspense patterns
-|   +-- typescript.md                     # TypeScript strict mode, generics, ESLint
-|   +-- java.md                           # Java
-|   +-- python.md                         # Python async, typing, pytest
-|   +-- go.md                             # Go goroutines, channels, context, interfaces
-|   +-- css.md                            # CSS variables, responsive design
-|   +-- architecture-review-guide.md      # SOLID, anti-patterns, coupling/cohesion
-|   +-- performance-review-guide.md       # Core Web Vitals, N+1, memory leaks
-|   +-- security-review-guide.md          # Security checklist (all languages)
-|   +-- common-bugs-checklist.md          # Language-specific bug patterns
-|   +-- code-review-best-practices.md     # Communication & process guidelines
-|
-+-- assets/
-|   +-- review-checklist.md               # Quick reference checklist
-|   +-- pr-review-template.md             # PR review comment template
-|
-+-- scripts/
-    +-- pr-analyzer.py                    # PR complexity analyzer
+```sh
+npx skills add joynal/code-review-skill --list
 ```
 
----
+To try changes from a local checkout, run this from another project and replace the path:
 
-### &#128640; Installation
-
-**Clone to your Claude Code skills directory:**
-
-```bash
-# macOS / Linux
-git clone https://github.com/joynal/code-review-skill.git \
-  ~/.claude/skills/code-review
+```sh
+npx skills add /absolute/path/to/code-review-skill --skill code-review --agent codex claude-code
 ```
 
-**Or add to an existing plugin:**
+The GitHub command installs the version pushed to GitHub, not uncommitted local changes. The root `SKILL.md` is directly discoverable by the [Skills CLI](https://github.com/vercel-labs/skills).
 
-```bash
-cp -r code-review-skill ~/.claude/plugins/your-plugin/skills/code-review/
+### Manual installation
+
+Copy the skill folder, including `SKILL.md`, `reference/`, `assets/`, `scripts/`, and `agents/`, into one of these locations, naming the folder `code-review`:
+
+| Agent       | Project                       | User                            |
+| ----------- | ----------------------------- | ------------------------------- |
+| Codex       | `.agents/skills/code-review/` | `~/.agents/skills/code-review/` |
+| Claude Code | `.claude/skills/code-review/` | `~/.claude/skills/code-review/` |
+
+These manual paths follow [Codex documentation](https://learn.chatgpt.com/docs/build-skills) and [Claude Code documentation](https://code.claude.com/docs/en/skills). The Skills CLI manages its own agent destinations, including Codex's `~/.codex/skills/` global destination. Avoid installing duplicate copies with the same name.
+
+## Use
+
+In Codex:
+
+```text
+Use $code-review to review my branch against origin/main.
 ```
 
----
+In Claude Code:
 
-### &#128161; Usage
-
-Once installed, activate the skill in your Claude Code session:
-
-```
-Use code-review to review this PR
+```text
+/code-review Review my branch against origin/main.
 ```
 
-Or create a custom slash command in `.claude/commands/`:
+Or ask naturally: “Review my staged changes for bugs.” Replace the base branch with your actual target.
 
-```markdown
-<!-- .claude/commands/review.md -->
+Other examples:
 
-Use code-review to perform a thorough review of the changes in this PR.
-Focus on: security, performance, and maintainability.
+- “Review this React component for state and request races.”
+- “Review this Python PR, focusing on cancellation and resource cleanup.”
+- “Review this Go service's authorization.”
+- “Review the architecture and migration compatibility of this change.”
+- “Review these changes and fix confirmed issues.” (Also authorizes local fixes.)
+
+The default review reports findings and validation limits. It does not submit a PR review or merge anything. References use the repository's actual language versions and tooling; they do not require migration to a newer stack.
+
+## Contents
+
+- [SKILL.md](SKILL.md): scope, workflow, evidence requirements, reference routing, and severity.
+- `reference/`: React, TypeScript/JavaScript, Python, Java, Go, CSS, security, performance, architecture, and cross-language checks.
+- [PR review template](assets/pr-review-template.md) and [checklist](assets/review-checklist.md): optional report assets.
+- [agents/openai.yaml](agents/openai.yaml): Codex display metadata; not needed by Claude Code.
+- [scripts/pr-analyzer.py](scripts/pr-analyzer.py): optional dependency-free diff inventory for Python 3.10+.
+- [Upgrade assessment](docs/upgrade-assessment.md): dated ecosystem findings, sources, and maintenance advice.
+
+## Optional analyzer
+
+Resolve the intended base/head and the installed script's absolute path:
+
+```sh
+git diff --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ origin/main...HEAD | python3 /absolute/path/to/code-review/scripts/pr-analyzer.py --stats
 ```
 
-**Example prompts:**
+Or pass a saved diff:
 
-| Prompt                               | What happens                                                          |
-| ------------------------------------ | --------------------------------------------------------------------- |
-| `Review this React component`        | Loads `react.md` - checks hooks, Server Components, Suspense patterns |
-| `Review this Java PR`                | Loads `java.md` - checks virtual threads, JPA, Spring Boot 3 patterns |
-| `Security review of this Go service` | Loads `go.md` + `security-review-guide.md`                            |
-| `Architecture review`                | Loads `architecture-review-guide.md` - SOLID, anti-patterns, coupling |
-| `Performance review`                 | Loads `performance-review-guide.md` - Web Vitals, N+1, complexity     |
+```sh
+python3 scripts/pr-analyzer.py --diff-file /path/to/change.diff --stats
+```
 
----
+The score and estimated minutes are rough size-based heuristics, not measured complexity, coverage, or merge criteria. Standard Git unified diffs are supported; combined merge diffs are rejected. Binary and rename-only files can be listed but their contents are not reviewed.
 
-### &#128196; License
+## Development checks
 
-MIT &copy; [Joynal](https://github.com/joynal)
+```sh
+python3 -m unittest discover -s tests -v
+npx skills add . --list
+```
+
+The tests exercise diff parsing, CLI behavior, and bundled Markdown links. GitHub Actions runs them on Python 3.10 and 3.14. Installation can be smoke-tested in an empty temporary project with the local-path command above.
+
+## License
+
+[MIT](LICENSE)

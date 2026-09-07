@@ -1,551 +1,120 @@
-# React Code Review Guide
+# React Review Guide
 
-- [React Code Review Guide](#react-code-review-guide)
-  - [Basic Hooks rules](#basic-hooks-rules)
-  - [useEffect mode](#useeffect-mode)
-  - [useMemo / useCallback](#usememo--usecallback)
-  - [Component design](#component-design)
-  - [Error Boundaries \& Suspense](#error-boundaries--suspense)
-  - [Server Components (RSC)](#server-components-rsc)
-  - [React 19 Actions \& Forms](#react-19-actions--forms)
-    - [useActionState](#useactionstate)
-    - [useFormStatus](#useformstatus)
-    - [useOptimistic](#useoptimistic)
-  - [Suspense](#suspense)
-    - [Basic Suspense](#basic-suspense)
-    - [Multiple independent Suspense boundaries](#multiple-independent-suspense-boundaries)
-    - [use() Hook (React 19)](#use-hook-react-19)
-  - [Review Checklists](#review-checklists)
-    - [Hooks Rules](#hooks-rules)
-    - [Performance Optimization (Moderation Principle)](#performance-optimization-moderation-principle)
-    - [Component Design](#component-design-1)
-    - [State Management](#state-management)
-    - [Error Handling](#error-handling)
-    - [Server Components (RSC)](#server-components-rsc-1)
-    - [React 19 Forms](#react-19-forms)
-    - [Suspense \& Streaming](#suspense--streaming)
-    - [Test](#test)
+Read the installed React/react-dom versions, framework/router, rendering mode, and compiler configuration first. React features and framework conventions are not interchangeable.
 
----
+## State, identity, and Hooks
 
-## Basic Hooks rules
+- Ordinary Hooks must retain call order across renders. React 19's `use` is an exception: it may appear in conditions and loops, but must run within a component or Hook and not inside `try/catch`. See [use](https://react.dev/reference/react/use).
+- Trace stale closures, state updates derived from an older render, and in-place mutations of shared state or props. Use functional updates when the new value depends on pending state.
+- Changing a component type or key remounts it. Look for nested component definitions and unstable keys that reset input, focus, or state; an index key is problematic when item identity can change.
+- Check controlled/uncontrolled input transitions, accessible labels, keyboard behavior, and pending/error states.
+
+## Effects and asynchronous work
+
+- Effects synchronize external systems. Verify dependencies against the values read and check setup/cleanup symmetry for subscriptions, timers, and connections.
+- Reproduce out-of-order responses when a dependency changes. Cancellation or an ignore flag must also guard error and loading updates where stale requests could overwrite current state.
+- A Promise settling after unmount is not by itself proof of a retained-resource leak. Identify the actual stale update or resource lifetime.
+- Derived data can usually be calculated during rendering. Whether an interaction belongs in an event handler depends on its trigger; do not move synchronization logic merely because it uses an Effect.
+- React 19.2's `useEffectEvent` separates non-reactive Effect logic. It is not a way to conceal a dependency that should resynchronize the Effect. With `Activity`, verify behavior when Effects disconnect while hidden and reconnect when visible. See [React 19.2](https://react.dev/blog/2025/10/01/react-19-2).
+
+## Memoization and rendering cost
+
+Check whether React Compiler is enabled and whether profiling identifies a costly render. Inline objects, functions, and missing `useMemo` are not defects on their own. Identity can matter for a memoized child or an Effect dependency, so trace the consumer before recommending a change.
+
+`useMemo` and `useCallback` are optimization tools, not persistence guarantees. Do not use them to guarantee the lifetime of a resource or a Promise whose stability is required for correctness. See [React Compiler](https://react.dev/learn/react-compiler).
+
+## Actions and forms (React 19+)
+
+- `useActionState` receives previous state before the action payload. Check the argument order and returned state; manual dispatch needs the appropriate Action/Transition context.
+- `useFormStatus` from `react-dom` observes an ancestor form, not a form returned by the component calling it. Passing pending state through props is also valid.
+- `useOptimistic` setters belong inside an Action, such as a form action or `startTransition`. On success, update the authoritative state; when the Action finishes, that state determines the display. Show failure feedback and distinguish pending UI from confirmed business outcomes. See [useOptimistic](https://react.dev/reference/react/useOptimistic).
+- A pending button is not a substitute for server-side idempotency, validation, or authorization.
+- Existing `useState` forms are valid. Adopt Actions when they solve a project need, not as a mandatory migration.
+
+## Server Components and security
+
+Apply RSC rules only where the framework supports them.
+
+- Keep secrets and server-only dependencies out of client-imported modules.
+- `'use client'` defines a boundary in the module dependency graph. It does not automatically convert Server Components passed as `children` into Client Components. Verify imports and supported serializable props. See [use client](https://react.dev/reference/rsc/use-client).
+- Server Functions are reachable entrypoints: validate untrusted arguments and authorize each operation. `'use server'` does not supply access control.
+- Distinguish server-only APIs from supported React APIs; “no Hooks in RSC” is too broad.
+- For security-sensitive changes, inspect resolved framework/RSC package versions and current official advisories.
+
+## Suspense and data libraries
+
+- Suspense handles supported suspending resources, not arbitrary fetching started in an Effect. Error boundaries and asynchronous rejection handling have different roles.
+- Choose boundaries according to the intended loading experience. An existing ancestor error boundary can be sufficient; one per Suspense is not required.
+- For client-side `use(promise)`, use a framework/cache-supported stable Promise or one passed from a Server Component. Creating a fresh Promise each render or relying on `useMemo` across initial suspension is unsafe.
+- When using a query library, inspect its installed version. Check query keys, invalidation, optimistic rollback, and error handling. Defaults such as a zero `staleTime` are not bugs without a concrete consequence.
+
+## Focused examples
+
+### Stale responses after a prop changes
+
+Inside a component, assume `userId` selects the displayed user, `loadUser(id)` returns a Promise, and `setUser`/`setError` are React state setters. These are alternative Effect bodies; retain the same surrounding component.
 
 ```tsx
-// ✅ Hooks must be called at the top level of the component
-function BadComponent({ isLoggedIn }) {
-  if (isLoggedIn) {
-    const [user, setUser] = useState(null);  // Error!
+// Bad: request A can overwrite request B after userId changes to B.
+useEffect(() => {
+  setUser(null);
+  setError(null);
+  loadUser(userId).then(setUser, setError);
+}, [userId, loadUser]);
+
+// Good: cleanup prevents obsolete success AND failure from changing the view.
+useEffect(() => {
+  let active = true;
+  setUser(null);
+  setError(null);
+  loadUser(userId).then(
+    user => { if (active) setUser(user); },
+    error => { if (active) setError(error); },
+  );
+  return () => { active = false; };
+}, [userId, loadUser]);
+```
+
+**Why:** resolve B before A and inspect the final user; also reject A after B succeeds. Both outcomes must leave B's view intact. This ignores obsolete results but does not cancel the network request. If request cancellation matters, also pass an AbortSignal to a supporting client. A stable module-level loader need not be a prop. See [Effect cleanup and fetching](https://react.dev/reference/react/useEffect).
+
+### Optimistic state needs an Action and a committed result (React 19+)
+
+Inside an editor component, assume `persistName(next)` resolves with the saved name. The UI displays `optimisticName`, shows `error`, and disables submission while `pending`. The two handlers below are alternatives, using this shared setup:
+
+```tsx
+const [name, setName] = useState(initialName);
+const [error, setError] = useState<string | null>(null);
+const [optimisticName, setOptimisticName] = useOptimistic(name);
+const [pending, startTransition] = useTransition();
+
+// Bad: an ordinary event callback provides no Action context.
+async function saveBad(next: string) {
+  setError(null);
+  setOptimisticName(next);
+  try {
+    await persistName(next);
+  } catch {
+    setError("Save failed");
   }
-  return <div>...</div>;
 }
 
-// ✅ Hooks must be called at the top level of the component
-function GoodComponent({ isLoggedIn }) {
-  const [user, setUser] = useState(null);
-  if (!isLoggedIn) return <LoginPrompt />;
-  return <div>{user?.name}</div>;
-}
-```
-
----
-
-## useEffect mode
-
-```tsx
-// ❌ The dependent array is missing or incomplete
-function BadEffect({ userId }) {
-  const [user, setUser] = useState(null);
-  useEffect(() => {
-    fetchUser(userId).then(setUser);
-}, []); // Missing userId dependency!
-}
-
-return () => { canceled = true; }; // Cleanup function
-function GoodEffect({ userId }) {
-  const [user, setUser] = useState(null);
-  useEffect(() => {
-    let cancelled = false;
-    fetchUser(userId).then(data => {
-      if (!cancelled) setUser(data);
-    });
-return () => { canceled = true; }; // Cleanup function
-  }, [userId]);
-}
-
-// ❌ useEffect is used to derive state (anti-pattern)
-function BadDerived({ items }) {
-  const [filteredItems, setFilteredItems] = useState([]);
-  useEffect(() => {
-    setFilteredItems(items.filter(i => i.active));
-}, [items]); // Unnecessary effect + extra rendering
-  return <List items={filteredItems} />;
-}
-
-// ✅ Calculate directly during rendering, or use useMemo
-function GoodDerived({ items }) {
-  const filteredItems = useMemo(
-    () => items.filter(i => i.active),
-    [items]
-  );
-  return <List items={filteredItems} />;
-}
-
-// ❌ useEffect is used for event response
-function BadEventEffect() {
-  const [query, setQuery] = useState('');
-  useEffect(() => {
-    if (query) {
-analytics.track('search', { query }); // Should be in the event handler
-    }
-  }, [query]);
-}
-
-// ✅ Perform side effects in event handlers
-function GoodEvent() {
-  const [query, setQuery] = useState('');
-  const handleSearch = (q: string) => {
-    setQuery(q);
-    analytics.track('search', { query: q });
-  };
-}
-```
-
----
-
-## useMemo / useCallback
-
-```tsx
-// ❌ Over-optimization — constants don’t need useMemo
-function OverOptimized() {
-const config = useMemo(() => ({ timeout: 5000 }), []); // meaningless
-  const handleClick = useCallback(() => {
-    console.log('clicked');
-}, []); // If not passed to the memo component, it is meaningless
-}
-
-// ✅ Optimize only when needed
-function ProperlyOptimized() {
-const config = { timeout: 5000 }; // Simple object defined directly
-  const handleClick = () => console.log('clicked');
-}
-
-// ❌ useCallback dependencies always change
-function BadCallback({ data }) {
-// data is a new object every time it is rendered, useCallback is invalid
-  const process = useCallback(() => {
-    return data.map(transform);
-  }, [data]);
-}
-
-// ✅ useMemo + useCallback is used with React.memo
-const MemoizedChild = React.memo(function Child({ onClick, items }) {
-  return <div onClick={onClick}>{items.length}</div>;
-});
-
-function Parent({ rawItems }) {
-  const items = useMemo(() => processItems(rawItems), [rawItems]);
-  const handleClick = useCallback(() => {
-    console.log(items.length);
-  }, [items]);
-  return <MemoizedChild onClick={handleClick} items={items} />;
-}
-```
-
----
-
-## Component design
-
-```tsx
-// ❌ Define components within components — create new components on each render
-function BadParent() {
-function ChildComponent() { // Each rendering is a new function!
-    return <div>child</div>;
-  }
-  return <ChildComponent />;
-}
-
-// ✅ Component is defined externally
-function ChildComponent() {
-  return <div>child</div>;
-}
-function GoodParent() {
-  return <ChildComponent />;
-}
-
-// ❌ Props are always new object references
-function BadProps() {
-  return (
-    <MemoizedComponent
-style={{ color: 'red' }} // Render a new object each time
-onClick={() => {}} // Render a new function each time
-    />
-  );
-}
-
-// ✅ Stable reference
-const style = { color: 'red' };
-function GoodProps() {
-  const handleClick = useCallback(() => {}, []);
-  return <MemoizedComponent style={style} onClick={handleClick} />;
-}
-```
-
----
-
-## Error Boundaries & Suspense
-
-```tsx
-// ❌ No error boundaries
-function BadApp() {
-  return (
-    <Suspense fallback={<Loading />}>
-<DataComponent /> {/* Error will cause the entire application to crash */}
-    </Suspense>
-  );
-}
-
-// ✅ Error Boundary Package Suspense
-function GoodApp() {
-  return (
-    <ErrorBoundary fallback={<ErrorUI />}>
-      <Suspense fallback={<Loading />}>
-        <DataComponent />
-      </Suspense>
-    </ErrorBoundary>
-  );
-}
-```
-
----
-
-## Server Components (RSC)
-
-```tsx
-// ❌ Use client attributes in Server Component
-// app/page.tsx (Server Component by default)
-function BadServerComponent() {
-  const [count, setCount] = useState(0);  // Error! No hooks in RSC
-  return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
-}
-
-// ✅ Extract interaction logic to Client Component
-// app/counter.tsx
-'use client';
-function Counter() {
-  const [count, setCount] = useState(0);
-  return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
-}
-
-// app/page.tsx (Server Component)
-async function GoodServerComponent() {
-<Counter /> {/* Client component */}
-  return (
-    <div>
-      <h1>{data.title}</h1>
-// ❌ 'use client' is not properly placed — the entire tree becomes client
-    </div>
-  );
-}
-
-// ❌ 'use client' is not properly placed — the entire tree becomes client
-// layout.tsx
-'use client'; // This will make all child components client components
-export default function Layout({ children }) { ... }
-
-// ✅ Only use 'use client' on components that require interaction
-// Isolate client logic to leaf components
-```
-
----
-
-## React 19 Actions & Forms
-
-React 19 introduces the Actions system and new form processing Hooks to simplify asynchronous operations and optimistic updates.
-
-### useActionState
-
-```tsx
-// ❌ Traditional way: multiple state variables
-function OldForm() {
-  const [isPending, setIsPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [data, setData] = useState(null);
-
-  const handleSubmit = async (formData: FormData) => {
-    setIsPending(true);
-    setError(null);
+// Good: keep the optimistic value pending, then commit the server result.
+function saveGood(next: string) {
+  setError(null);
+  startTransition(async () => {
+    setOptimisticName(next);
     try {
-      const result = await submitForm(formData);
-      setData(result);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setIsPending(false);
-    }
-  };
-}
-
-// ✅ React 19: useActionState unified management
-import { useActionState } from 'react';
-
-function NewForm() {
-  const [state, formAction, isPending] = useActionState(
-    async (prevState, formData: FormData) => {
-      try {
-        const result = await submitForm(formData);
-        return { success: true, data: result };
-      } catch (e) {
-        return { success: false, error: e.message };
-      }
-    },
-    { success: false, data: null, error: null }
-  );
-
-  return (
-    <form action={formAction}>
-      <input name="email" />
-      <button disabled={isPending}>
-        {isPending ? 'Submitting...' : 'Submit'}
-      </button>
-      {state.error && <p className="error">{state.error}</p>}
-    </form>
-  );
-}
-```
-
-### useFormStatus
-
-```tsx
-// ❌ Props transparently transmit form status
-function BadSubmitButton({ isSubmitting }) {
-  return <button disabled={isSubmitting}>Submit</button>;
-}
-
-// ✅ useFormStatus access parent <form> status (no props required)
-import { useFormStatus } from 'react-dom';
-
-function SubmitButton() {
-  const { pending, data, method, action } = useFormStatus();
-// Note: must be used in subcomponents inside <form>
-  return (
-    <button disabled={pending}>
-      {pending ? 'Submitting...' : 'Submit'}
-    </button>
-  );
-}
-
-// ❌ useFormStatus is called in the form sibling component - does not work
-function BadForm() {
-const { pending } = useFormStatus(); // The status cannot be obtained here!
-  return (
-    <form action={action}>
-      <button disabled={pending}>Submit</button>
-    </form>
-  );
-}
-
-// ✅ useFormStatus must be in the subcomponent of form
-function GoodForm() {
-  return (
-    <form action={action}>
-<SubmitButton /> {/* useFormStatus is called here */}
-    </form>
-  );
-}
-```
-
-### useOptimistic
-
-```tsx
-// ❌ Wait for server response before updating UI
-function SlowLike({ postId, likes }) {
-  const [likeCount, setLikeCount] = useState(likes);
-  const [isPending, setIsPending] = useState(false);
-
-  const handleLike = async () => {
-    setIsPending(true);
-const newCount = await likePost(postId); // Wait...
-    setLikeCount(newCount);
-    setIsPending(false);
-  };
-}
-
-// ✅ useOptimistic instant feedback, automatic rollback on failure
-import { useOptimistic } from 'react';
-
-function FastLike({ postId, likes }) {
-  const [optimisticLikes, addOptimisticLike] = useOptimistic(
-    likes,
-    (currentLikes, increment: number) => currentLikes + increment
-  );
-
-  const handleLike = async () => {
-addOptimisticLike(1); // Update UI immediately
-    try {
-await likePost(postId); // Background synchronization
+      const savedName = await persistName(next);
+      startTransition(() => { setName(savedName); });
     } catch {
-// React automatically rolls back to the original value of likes
+      setError("Save failed");
     }
-  };
-
-  return <button onClick={handleLike}>{optimisticLikes} likes</button>;
+  });
 }
 ```
 
-## Suspense
+**Why:** the bad handler triggers the outside-Action warning and never updates `name`, so it cannot retain the saved result. The good handler displays the optimistic value during the request, then uses the authoritative response; on failure it retains the prior name and reports the error. The nested transition marks the update after `await`. Assume one submission at a time; overlapping writes need additional ordering semantics. See [useOptimistic](https://react.dev/reference/react/useOptimistic).
 
-### Basic Suspense
+## Validation
 
-```tsx
-// ❌ Traditional loading state management
-function OldComponent() {
-  const [data, setData] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
-
-  useEffect(() => {
-    fetchData().then(setData).finally(() => setIsLoading(false));
-  }, []);
-
-  if (isLoading) return <Spinner />;
-  return <DataView data={data} />;
-}
-
-// ✅ Suspense declarative loading state
-function NewComponent() {
-  return (
-    <Suspense fallback={<Spinner />}>
-### Multiple independent Suspense boundaries
-    </Suspense>
-  );
-}
-```
-
-### Multiple independent Suspense boundaries
-
-```tsx
-// ❌ Single boundary - all content is loaded together
-function BadLayout() {
-  return (
-    <Suspense fallback={<FullPageSpinner />}>
-      <Header />
-<Sidebar /> {/* Fast */}
-<Sidebar /> {/* Fast */}
-    </Suspense>
-  );
-}
-
-// ✅ Independent borders - each part streams independently
-function GoodLayout() {
-  return (
-    <>
-<Header /> {/* Display immediately */}
-      <div className="flex">
-        <Suspense fallback={<ContentSkeleton />}>
-<MainContent /> {/* Independent loading */}
-        </Suspense>
-        <Suspense fallback={<SidebarSkeleton />}>
-<Sidebar /> {/* Independent loading */}
-        </Suspense>
-      </div>
-    </>
-  );
-}
-```
-
-### use() Hook (React 19)
-
-```tsx
-// ✅ Read Promise in the component
-import { use } from 'react';
-
-function Comments({ commentsPromise }) {
-const comments = use(commentsPromise); // Automatically trigger Suspense
-  return (
-    <ul>
-      {comments.map(c => <li key={c.id}>{c.text}</li>)}
-    </ul>
-  );
-}
-
-//The parent component creates Promise and the child component consumes it
-function Post({ postId }) {
-const commentsPromise = fetchComments(postId); // no await
-  return (
-    <article>
-      <PostContent id={postId} />
-      <Suspense fallback={<CommentsSkeleton />}>
-        <Comments commentsPromise={commentsPromise} />
-      </Suspense>
-    </article>
-  );
-}
-```
-
----
-
-## Review Checklists
-
-### Hooks Rules
-
-- [ ] Hooks are called at the top level of components/custom hooks.
-- [ ] Hooks are called without a condition/loop.
-- [ ] useEffect dependency array complete
-- [ ] useEffect has cleanup functions (subscriptions/timers/requests).
-- [ ] The derived state was not calculated using useEffect.
-
-### Performance Optimization (Moderation Principle)
-
-- [ ] useMemo/useCallback should only be used in scenarios where it is truly needed.
-- [ ] React.memo works in conjunction with stable props references
-- [ ] No child component is defined within the component.
-- [ ] No new object/function is created in JSX (unless passed to a non-memo component)
-- [ ] Long lists use virtualization (react-window/react-virtual)
-
-### Component Design
-
-- [ ] Components have a single responsibility and should not exceed 200 lines.
-- [ ] Separation of logic and presentation (Custom Hooks)
-- [ ] The Props interface is clear and uses TypeScript.
-- [ ] Avoid Props Drilling (consider context or combination)
-
-### State Management
-
-- [ ] Proximity principle (minimum necessary range)
-- [ ] Use useReducer for complex states
-- [ ] Global state uses Context or a state library.
-- [ ] Avoid unnecessary state (derivative > storage)
-
-### Error Handling
-
-- [ ] The critical area contains Error Boundary
-- [ ] Suspense is used in conjunction with Error Boundary.
-- [ ] Asynchronous operations have error handling
-
-### Server Components (RSC)
-
-- [ ] 'use client' is only used for components that require interaction.
-- [ ] Server Component does not use Hooks/Event Handling
-- [ ] Client-side components should be placed in leaf nodes whenever possible.
-- [ ] Data retrieval is performed in the Server Component.
-
-### React 19 Forms
-
-- [ ] Use useActionState instead of multiple useState instances
-- [ ] useFormStatus is called in the form child component.
-- [ ] useOptimistic Not for critical business operations (payments, etc.)
-- [ ] Server Action is correctly marked 'use server'
-
-### Suspense & Streaming
-
-- [ ] Define Suspense boundaries based on user experience requirements
-- [ ] Each Suspense has a corresponding Error Boundary
-- [ ] Provides a meaningful fallback (skeleton screen > Spinner)
-- [ ] Avoid waiting for slow data at the layout level
-
-### Test
-
-- [ ] Using @testing-library/react
-- [ ] Use screen to search for elements
-- [ ] Use userEvent instead of fireEvent
-- [ ] Prefer *ByRole for queries
-- [ ] Test behavior, not implementation details
+Exercise rapid prop changes, rejected requests, repeated submissions, unmount/remount, and hydration where relevant. Use the existing test stack to assert observable behavior. Missing a preferred testing library or choosing `fireEvent` for a specific low-level event is not a defect.
